@@ -78,7 +78,7 @@ impl Autoformat {
 ///
 /// Doesn't do mod-descending, so it will still try to format unreachable files. TODO.
 async fn autoformat_project(check: bool) -> Result<()> {
-    let crate_config = crate::CrateConfig::new()?;
+    let crate_config = crate::CrateConfig::new(None)?;
 
     let mut files_to_format = vec![];
     collect_rs_files(&crate_config.crate_dir, &mut files_to_format);
@@ -136,12 +136,16 @@ async fn autoformat_project(check: bool) -> Result<()> {
 }
 
 fn collect_rs_files(folder: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(folder) = folder.read_dir() else { return };
+    let Ok(folder) = folder.read_dir() else {
+        return;
+    };
 
     // load the gitignore
 
     for entry in folder {
-        let Ok(entry) = entry else { continue; };
+        let Ok(entry) = entry else {
+            continue;
+        };
 
         let path = entry.path();
 
