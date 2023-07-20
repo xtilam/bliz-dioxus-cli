@@ -78,7 +78,7 @@ impl Autoformat {
 ///
 /// Doesn't do mod-descending, so it will still try to format unreachable files. TODO.
 async fn autoformat_project(check: bool) -> Result<()> {
-    let crate_config = crate::CrateConfig::new()?;
+    let crate_config = crate::CrateConfig::new(None)?;
 
     let mut files_to_format = vec![];
     collect_rs_files(&crate_config.crate_dir, &mut files_to_format);
@@ -109,11 +109,17 @@ async fn autoformat_project(check: bool) -> Result<()> {
             })
             .await;
 
-            if res.is_err() {
-                eprintln!("error formatting file: {}", _path.display());
+            match res {
+                Err(err) => {
+                    eprintln!("error formatting file: {}\n{err}", _path.display());
+                    None
+                }
+                Ok(Err(err)) => {
+                    eprintln!("error formatting file: {}\n{err}", _path.display());
+                    None
+                }
+                Ok(Ok(res)) => Some(res),
             }
-
-            res
         })
         .collect::<FuturesUnordered<_>>()
         .collect::<Vec<_>>()
@@ -122,7 +128,7 @@ async fn autoformat_project(check: bool) -> Result<()> {
     let files_formatted: usize = counts
         .into_iter()
         .map(|f| match f {
-            Ok(Ok(res)) => res,
+            Some(res) => res,
             _ => 0,
         })
         .sum();
@@ -136,12 +142,16 @@ async fn autoformat_project(check: bool) -> Result<()> {
 }
 
 fn collect_rs_files(folder: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(folder) = folder.read_dir() else { return };
+    let Ok(folder) = folder.read_dir() else {
+        return;
+    };
 
     // load the gitignore
 
     for entry in folder {
-        let Ok(entry) = entry else { continue; };
+        let Ok(entry) = entry else {
+            continue;
+        };
 
         let path = entry.path();
 

@@ -1,3 +1,4 @@
+use crate::cfg::Platform;
 #[cfg(feature = "plugin")]
 use crate::plugin::PluginManager;
 
@@ -12,8 +13,8 @@ pub struct Build {
 }
 
 impl Build {
-    pub fn build(self) -> Result<()> {
-        let mut crate_config = crate::CrateConfig::new()?;
+    pub fn build(self, bin: Option<PathBuf>) -> Result<()> {
+        let mut crate_config = crate::CrateConfig::new(bin)?;
 
         // change the release state.
         crate_config.with_release(self.build.release);
@@ -31,26 +32,20 @@ impl Build {
             crate_config.set_features(self.build.features.unwrap());
         }
 
-        let platform = self.build.platform.unwrap_or_else(|| {
-            crate_config
-                .dioxus_config
-                .application
-                .default_platform
-                .clone()
-        });
+        let platform = self
+            .build
+            .platform
+            .unwrap_or(crate_config.dioxus_config.application.default_platform);
 
         #[cfg(feature = "plugin")]
         let _ = PluginManager::on_build_start(&crate_config, &platform);
 
-        match platform.as_str() {
-            "web" => {
+        match platform {
+            Platform::Web => {
                 crate::builder::build(&crate_config, false)?;
             }
-            "desktop" => {
+            Platform::Desktop => {
                 crate::builder::build_desktop(&crate_config, false)?;
-            }
-            _ => {
-                return custom_error!("Unsupported platform target.");
             }
         }
 
