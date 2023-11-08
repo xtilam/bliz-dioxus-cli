@@ -1,4 +1,5 @@
-use crate::{cfg::Platform, error::Result};
+use crate::error::Result;
+use dioxus_cli_config::{crate_root, Metadata, Platform};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -24,7 +25,7 @@ fn default_plugin() -> toml::Value {
 
 impl DioxusConfig {
     pub fn load(bin: Option<PathBuf>) -> crate::error::Result<Option<DioxusConfig>> {
-        let crate_dir = crate::cargo::crate_root();
+        let crate_dir = crate_root();
 
         let crate_dir = match crate_dir {
             Ok(dir) => {
@@ -224,7 +225,7 @@ impl CrateConfig {
     pub fn new(bin: Option<PathBuf>) -> Result<Self> {
         let dioxus_config = DioxusConfig::load(bin.clone())?.unwrap_or_default();
 
-        let crate_root = crate::cargo::crate_root()?;
+        let crate_root = crate_root()?;
 
         let crate_dir = if let Some(package) = &dioxus_config.application.sub_package {
             crate_root.join(package)
@@ -234,7 +235,7 @@ impl CrateConfig {
             crate_root
         };
 
-        let meta = crate::cargo::Metadata::get()?;
+        let meta = Metadata::get()?;
         let workspace_dir = meta.workspace_root;
         let target_dir = meta.target_directory;
 
