@@ -1,15 +1,19 @@
-use crate::Result;
+use crate::{Error, Result};
 use dioxus_cli_config::WebProxyConfig;
 
 use anyhow::{anyhow, Context};
-use axum::{http::StatusCode, routing::any, Router};
+use axum::body::Body as MyBody;
+use axum::body::Body;
+use axum::{
+    http::StatusCode,
+    routing::{any, MethodRouter},
+    Router,
+};
 use hyper::{Request, Response, Uri};
 use hyper_util::{
     client::legacy::{self, connect::HttpConnector},
     rt::TokioExecutor,
 };
-
-use axum::body::Body as MyBody;
 
 #[derive(Debug, Clone)]
 struct ProxyClient {
@@ -19,6 +23,7 @@ struct ProxyClient {
 
 impl ProxyClient {
     fn new(url: Uri) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
             .unwrap()
@@ -63,28 +68,7 @@ pub fn add_proxy(mut router: Router, proxy: &WebProxyConfig) -> Result<Router> {
         )));
     }
 
-    let client = ProxyClient::new(url);
-
-    let method_router = any(move |mut req: Request<MyBody>| async move {
-        // Prevent request loops
-        if req.headers().get("x-proxied-by-dioxus").is_some() {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "API is sharing a loopback with the dev server. Try setting a different port on the API config."
-                    .to_string(),
-            ));
-        }
-
-        req.headers_mut().insert(
-            "x-proxied-by-dioxus",
-            "true".parse().expect("header value is valid"),
-        );
-
-        client
-            .send(req)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-    });
+    let method_router = proxy_to(url, false, handle_proxy_error);
 
     // api/*path
     router = router.route(
@@ -105,6 +89,48 @@ pub fn add_proxy(mut router: Router, proxy: &WebProxyConfig) -> Result<Router> {
     );
 
     Ok(router)
+}
+
+pub(crate) fn proxy_to(
+    url: Uri,
+    nocache: bool,
+    handle_error: fn(Error) -> Response<Body>,
+) -> MethodRouter {
+    let client = ProxyClient::new(url);
+
+    any(move |mut req: Request<MyBody>| async move {
+        // Prevent request loops
+        if req.headers().get("x-proxied-by-dioxus").is_some() {
+            return Err(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(
+                    "API is sharing a loopback with the dev server. Try setting a different port on the API config.",
+                ))
+                .unwrap());
+        }
+
+        req.headers_mut().insert(
+            "x-proxied-by-dioxus",
+            "true".parse().expect("header value is valid"),
+        );
+
+        if nocache {
+            crate::serve::insert_no_cache_headers(req.headers_mut());
+        }
+
+        client.send(req).await.map_err(handle_error)
+    })
+}
+
+fn handle_proxy_error(e: Error) -> axum::http::Response<axum::body::Body> {
+    tracing::error!("Proxy error: {}", e);
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        .body(axum::body::Body::from(format!(
+            "Proxy connection failed: {:#?}",
+            e
+        )))
+        .unwrap()
 }
 
 #[cfg(test)]
