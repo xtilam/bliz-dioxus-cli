@@ -3,12 +3,15 @@ use crate::{assets::AssetManifest, TraceSrc};
 use crate::{BuildRequest, Platform};
 use anyhow::Context;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use std::sync::atomic::AtomicUsize;
 use std::{
     fs::create_dir_all,
     path::{Path, PathBuf},
 };
+use std::{sync::atomic::AtomicUsize, time::Duration};
+use tokio::process::Command;
 use wasm_bindgen_cli_support::Bindgen;
+
+use super::templates::InfoPlistData;
 
 /// The end result of a build.
 ///
@@ -93,13 +96,14 @@ pub(crate) struct AppBundle {
 pub struct BuildArtifacts {
     pub(crate) exe: PathBuf,
     pub(crate) assets: AssetManifest,
+    pub(crate) time_taken: Duration,
 }
 
 impl AppBundle {
     /// ## Web:
     /// Create a folder that is somewhat similar to an app-image (exe + asset)
     /// The server is dropped into the `web` folder, even if there's no `public` folder.
-    /// If there's no server (SPA/static-gen), we still use the `web` folder, but it only contains the
+    /// If there's no server (SPA), we still use the `web` folder, but it only contains the
     /// public folder.
     /// ```
     /// web/
@@ -255,50 +259,38 @@ impl AppBundle {
     /// root().join(bundled)
     /// ```
     pub(crate) async fn new(
-        request: BuildRequest,
+        build: BuildRequest,
         app: BuildArtifacts,
         server: Option<BuildArtifacts>,
     ) -> Result<Self> {
-        let bundle = Self {
-            app,
-            server,
-            build: request,
-        };
+        let bundle = Self { app, server, build };
 
         tracing::debug!("Assembling app bundle");
 
         bundle.build.status_start_bundle();
-        bundle.prepare_build_dir()?;
-        bundle.write_main_executable().await?;
+        /*
+            assume the build dir is already created by BuildRequest
+            todo(jon): maybe refactor this a bit to force AppBundle to be created before it can be filled in
+        */
+        bundle
+            .write_main_executable()
+            .await
+            .context("Failed to write main executable")?;
         bundle.write_server_executable().await?;
-        bundle.write_assets().await?;
+        bundle
+            .write_assets()
+            .await
+            .context("Failed to write assets")?;
         bundle.write_metadata().await?;
         bundle.optimize().await?;
+        bundle
+            .assemble()
+            .await
+            .context("Failed to assemble app bundle")?;
+
+        tracing::debug!("Bundle created at {}", bundle.build.root_dir().display());
 
         Ok(bundle)
-    }
-
-    /// We only really currently care about:
-    ///
-    /// - app dir (.app, .exe, .apk, etc)
-    /// - assets dir
-    /// - exe dir (.exe, .app, .apk, etc)
-    /// - extra scaffolding
-    ///
-    /// It's not guaranteed that they're different from any other folder
-    fn prepare_build_dir(&self) -> Result<()> {
-        _ = std::fs::remove_dir_all(self.app_dir());
-
-        create_dir_all(self.app_dir())?;
-        create_dir_all(self.exe_dir())?;
-        create_dir_all(self.asset_dir())?;
-
-        // we could download the templates from somewhere (github?) but after having banged my head against
-        // cargo-mobile2 for ages, I give up with that. We're literally just going to hardcode the templates
-        // by writing them here.
-        if let Platform::Android = self.build.build.platform() {}
-
-        Ok(())
     }
 
     /// Take the output of rustc and make it into the main exe of the bundle
@@ -333,18 +325,17 @@ impl AppBundle {
             Platform::Web => {
                 // Run wasm-bindgen and drop its output into the assets folder under "dioxus"
                 self.build.status_wasm_bindgen_start();
-                self.run_wasm_bindgen(&self.app.exe.with_extension("wasm"), &self.exe_dir())
+                self.run_wasm_bindgen(&self.app.exe.with_extension("wasm"), &self.build.exe_dir())
                     .await?;
 
                 // Only run wasm-opt if the feature is enabled
                 // Wasm-opt has an expensive build script that makes it annoying to keep enabled for iterative dev
                 // We put it behind the "wasm-opt" feature flag so that it can be disabled when iterating on the cli
-                self.build.status_wasm_opt_start();
-                self.run_wasm_opt(&self.exe_dir())?;
+                self.run_wasm_opt(&self.build.exe_dir())?;
 
                 // Write the index.html file with the pre-configured contents we got from pre-rendering
                 std::fs::write(
-                    self.app_dir().join("index.html"),
+                    self.build.root_dir().join("index.html"),
                     self.build.prepare_html()?,
                 )?;
             }
@@ -385,7 +376,7 @@ impl AppBundle {
             return Ok(());
         }
 
-        let asset_dir = self.asset_dir();
+        let asset_dir = self.build.asset_dir();
 
         // First, clear the asset dir
         // todo(jon): cache the asset dir, removing old files and only copying new ones that changed since the last build
@@ -418,10 +409,9 @@ impl AppBundle {
         // Parallel Copy over the assets and keep track of progress with an atomic counter
         // todo: we want to use the fastfs variant that knows how to parallelize folders, too
         assets_to_transfer.par_iter().try_for_each(|(from, to)| {
-            self.build.status_copying_asset(
-                assets_finished.fetch_add(0, std::sync::atomic::Ordering::SeqCst),
-                asset_count,
-                from.clone(),
+            tracing::trace!(
+                "Starting asset copy {current}/{asset_count} from {from:?}",
+                current = assets_finished.fetch_add(0, std::sync::atomic::Ordering::SeqCst),
             );
 
             // todo(jon): implement optimize + pre_compress on the asset type
@@ -431,7 +421,7 @@ impl AppBundle {
                 tracing::error!("Failed to copy asset {from:?}: {err}");
             }
 
-            self.build.status_copying_asset(
+            self.build.status_copied_asset(
                 assets_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
                 asset_count,
                 from.clone(),
@@ -443,66 +433,11 @@ impl AppBundle {
         Ok(())
     }
 
-    /// The directory in which we'll put the main exe
-    ///
-    /// Mac, Android, Web are a little weird
-    /// - mac wants to be in Contents/MacOS
-    /// - android wants to be in jniLibs/arm64-v8a (or others, depending on the platform / architecture)
-    /// - web wants to be in wasm (which... we don't really need to, we could just drop the wasm into public and it would work)
-    ///
-    /// I think all others are just in the root folder
-    ///
-    /// todo(jon): investigate if we need to put .wasm in `wasm`. It kinda leaks implementation details, which ideally we don't want to do.
-    pub fn exe_dir(&self) -> PathBuf {
-        match self.build.build.platform() {
-            Platform::MacOS => self.app_dir().join("Contents").join("MacOS"),
-            Platform::Android => self.app_dir().join("jniLibs").join("arm64-v8a"),
-            Platform::Web => self.app_dir().join("wasm"),
-
-            // these are all the same, I think?
-            Platform::Windows
-            | Platform::Linux
-            | Platform::Ios
-            | Platform::Server
-            | Platform::Liveview => self.app_dir(),
-        }
-    }
-
     /// The item that we'll try to run directly if we need to.
     ///
     /// todo(jon): we should name the app properly instead of making up the exe name. It's kinda okay for dev mode, but def not okay for prod
     pub fn main_exe(&self) -> PathBuf {
-        // todo(jon): this could just be named `App` or the name of the app like `Raycast` in `Raycast.app`
-        match self.build.build.platform() {
-            Platform::MacOS => self.exe_dir().join("DioxusApp"),
-            Platform::Ios => self.exe_dir().join("DioxusApp"),
-            Platform::Server => self.exe_dir().join("server"),
-            Platform::Liveview => self.exe_dir().join("server"),
-            Platform::Windows => self.exe_dir().join("app.exe"),
-            Platform::Linux => self.exe_dir().join("AppRun"), // from the appimage spec, the root exe needs to be named `AppRun`
-            Platform::Android => self.exe_dir().join("libdioxusapp.so"), // from the apk spec, the root exe will actually be a shared library
-            Platform::Web => unimplemented!("there's no main exe on web"), // this will be wrong, I think, but not important?
-        }
-    }
-
-    pub fn asset_dir(&self) -> PathBuf {
-        match self.build.build.platform() {
-            // macos why are you weird
-            Platform::MacOS => self
-                .app_dir()
-                .join("Contents")
-                .join("Resources")
-                .join("assets"),
-
-            // everyone else is soooo normal, just app/assets :)
-            Platform::Web
-            | Platform::Ios
-            | Platform::Windows
-            | Platform::Linux
-            | Platform::Android
-            | Platform::Server
-            | Platform::Liveview => self.app_dir().join("assets"),
-        }
+        self.build.exe_dir().join(self.build.platform_exe_name())
     }
 
     /// We always put the server in the `web` folder!
@@ -531,15 +466,15 @@ impl AppBundle {
         // write the Info.plist file
         match self.build.build.platform() {
             Platform::MacOS => {
-                let src = include_str!("../../assets/macos/mac.plist");
-                let dest = self.app_dir().join("Contents").join("Info.plist");
-                std::fs::write(dest, src)?;
+                let dest = self.build.root_dir().join("Contents").join("Info.plist");
+                let plist = self.macos_plist_contents()?;
+                std::fs::write(dest, plist)?;
             }
 
             Platform::Ios => {
-                let src = include_str!("../../assets/ios/ios.plist");
-                let dest = self.app_dir().join("Info.plist");
-                std::fs::write(dest, src)?;
+                let dest = self.build.root_dir().join("Info.plist");
+                let plist = self.ios_plist_contents()?;
+                std::fs::write(dest, plist)?;
             }
 
             // AndroidManifest.xml
@@ -575,7 +510,7 @@ impl AppBundle {
                     .krate
                     .should_pre_compress_web_assets(self.build.build.release);
 
-                let bindgen_dir = self.exe_dir();
+                let bindgen_dir = self.build.exe_dir();
                 tokio::task::spawn_blocking(move || {
                     crate::fastfs::pre_compress_folder(&bindgen_dir, pre_compress)
                 })
@@ -616,37 +551,6 @@ impl AppBundle {
         }
 
         None
-    }
-
-    /// returns the path to .app/.apk/.appimage folder
-    ///
-    /// we only add an extension to the folders where it sorta matters that it's named with the extension.
-    /// for example, on mac, the `.app` indicates we can `open` it and it pulls in icons, dylibs, etc.
-    ///
-    /// for our simulator-based platforms, this is less important since they need to be zipped up anyways
-    /// to run in the simulator.
-    ///
-    /// For windows/linux, it's also not important since we're just running the exe directly out of the folder
-    pub(crate) fn app_dir(&self) -> PathBuf {
-        let platform_dir = self
-            .build
-            .krate
-            .build_dir(self.build.build.platform(), self.build.build.release);
-
-        match self.build.build.platform() {
-            Platform::Web => platform_dir.join("public"),
-            Platform::Server => platform_dir.clone(), // ends up *next* to the public folder
-
-            // These might not actually need to be called `.app` but it does let us run these with `open`
-            Platform::MacOS => platform_dir.join("DioxusApp.app"),
-            Platform::Ios => platform_dir.join("DioxusApp.app"),
-
-            // in theory, these all could end up in the build dir
-            Platform::Linux => platform_dir.join("app"), // .appimage (after bundling)
-            Platform::Windows => platform_dir.join("app"), // .exe (after bundling)
-            Platform::Android => platform_dir.join("app"), // .apk (after bundling)
-            Platform::Liveview => platform_dir.join("app"), // .exe (after bundling)
-        }
     }
 
     pub(crate) async fn run_wasm_bindgen(
@@ -691,7 +595,6 @@ impl AppBundle {
         if !self.build.build.release {
             return Ok(());
         };
-
         self.build.status_optimizing_wasm();
 
         #[cfg(feature = "optimizations")]
@@ -798,5 +701,77 @@ impl AppBundle {
         drop(_child);
 
         Ok(())
+    }
+
+    pub(crate) fn bundle_identifier(&self) -> String {
+        format!("com.dioxuslabs.{}", self.build.krate.executable_name())
+    }
+
+    fn macos_plist_contents(&self) -> Result<String> {
+        handlebars::Handlebars::new()
+            .render_template(
+                include_str!("../../assets/macos/mac.plist.hbs"),
+                &InfoPlistData {
+                    display_name: self.build.platform_exe_name(),
+                    bundle_name: self.build.platform_exe_name(),
+                    executable_name: self.build.platform_exe_name(),
+                    bundle_identifier: format!("com.dioxuslabs.{}", self.build.platform_exe_name()),
+                },
+            )
+            .map_err(|e| e.into())
+    }
+
+    fn ios_plist_contents(&self) -> Result<String> {
+        handlebars::Handlebars::new()
+            .render_template(
+                include_str!("../../assets/ios/ios.plist.hbs"),
+                &InfoPlistData {
+                    display_name: self.build.platform_exe_name(),
+                    bundle_name: self.build.platform_exe_name(),
+                    executable_name: self.build.platform_exe_name(),
+                    bundle_identifier: format!("com.dioxuslabs.{}", self.build.platform_exe_name()),
+                },
+            )
+            .map_err(|e| e.into())
+    }
+
+    /// Run any final tools to produce apks or other artifacts we might need.
+    async fn assemble(&self) -> Result<()> {
+        if let Platform::Android = self.build.build.platform() {
+            // make sure we can execute the gradlew script
+            #[cfg(unix)]
+            {
+                use std::os::unix::prelude::PermissionsExt;
+                std::fs::set_permissions(
+                    self.build.root_dir().join("gradlew"),
+                    std::fs::Permissions::from_mode(0o755),
+                )?;
+            }
+
+            let output = Command::new("./gradlew")
+                .arg("assembleDebug")
+                .current_dir(self.build.root_dir())
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                return Err(anyhow::anyhow!("Failed to assemble apk: {output:?}").into());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn apk_path(&self) -> PathBuf {
+        self.build
+            .root_dir()
+            .join("app")
+            .join("build")
+            .join("outputs")
+            .join("apk")
+            .join("debug")
+            .join("app-debug.apk")
     }
 }

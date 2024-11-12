@@ -1,5 +1,5 @@
 //! Report progress about the build to the user. We use channels to report progress back to the CLI.
-use crate::{AppBundle, BuildRequest, Platform, TraceSrc};
+use crate::{AppBundle, BuildRequest, BuildStage, Platform, TraceSrc};
 use cargo_metadata::CompilerMessage;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use std::path::PathBuf;
@@ -16,42 +16,8 @@ pub(crate) enum BuildUpdate {
     BuildFailed { err: crate::Error },
 }
 
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BuildStage {
-    Initializing,
-    Starting {
-        platform: Platform,
-        crate_count: usize,
-    },
-    InstallingTooling {},
-    Compiling {
-        platform: Platform,
-        current: usize,
-        total: usize,
-        krate: String,
-    },
-    Bundling {},
-    RunningBindgen {},
-    OptimizingWasm {},
-    CopyingAssets {
-        current: usize,
-        total: usize,
-        path: PathBuf,
-    },
-    Success,
-    Failed,
-    Aborted,
-    Restarting,
-}
-
 impl BuildRequest {
     pub(crate) fn status_wasm_bindgen_start(&self) {
-        _ = self.progress.unbounded_send(BuildUpdate::Progress {
-            stage: BuildStage::RunningBindgen {},
-        });
-    }
-    pub(crate) fn status_wasm_opt_start(&self) {
         _ = self.progress.unbounded_send(BuildUpdate::Progress {
             stage: BuildStage::RunningBindgen {},
         });
@@ -73,19 +39,13 @@ impl BuildRequest {
         tracing::trace!(dx_src = ?TraceSrc::Cargo, "{line}");
     }
 
-    pub(crate) fn status_build_progress(
-        &self,
-        count: usize,
-        total: usize,
-        name: String,
-        platform: Platform,
-    ) {
+    pub(crate) fn status_build_progress(&self, count: usize, total: usize, name: String) {
         _ = self.progress.unbounded_send(BuildUpdate::Progress {
             stage: BuildStage::Compiling {
                 current: count,
                 total,
                 krate: name,
-                platform,
+                is_server: self.is_server(),
             },
         });
     }
@@ -93,14 +53,13 @@ impl BuildRequest {
     pub(crate) fn status_starting_build(&self, crate_count: usize) {
         _ = self.progress.unbounded_send(BuildUpdate::Progress {
             stage: BuildStage::Starting {
-                platform: self.build.platform(),
+                is_server: self.build.platform() == Platform::Server,
                 crate_count,
             },
         });
     }
 
-    pub(crate) fn status_copying_asset(&self, current: usize, total: usize, path: PathBuf) {
-        tracing::trace!("Status copying asset {current}/{total} from {path:?}");
+    pub(crate) fn status_copied_asset(&self, current: usize, total: usize, path: PathBuf) {
         _ = self.progress.unbounded_send(BuildUpdate::Progress {
             stage: BuildStage::CopyingAssets {
                 current,
@@ -120,5 +79,9 @@ impl BuildRequest {
         _ = self.progress.unbounded_send(BuildUpdate::Progress {
             stage: BuildStage::InstallingTooling {},
         });
+    }
+
+    pub(crate) fn is_server(&self) -> bool {
+        self.build.platform() == Platform::Server
     }
 }
