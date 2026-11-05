@@ -195,3 +195,111 @@ pkg-fmt = "zip"
 
 [package.metadata.docs.rs]
 all-features = false
+
+# This repository contains only the `packages/cli` subdirectory of the Dioxus
+# monorepo. Define a local workspace root so the `workspace = true` entries above
+# can resolve, and point every Dioxus-internal dependency at the upstream
+# `v0.7.10` tag instead of the monorepo's `path` dependencies.
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "0.7.10"
+
+[workspace.dependencies]
+# Dioxus internal crates: use the upstream git tag because this checkout only
+# contains the CLI package.
+dioxus-autofmt = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-rsx-rosetta = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-rsx = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-rsx-hotreload = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-html = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10", default-features = false }
+dioxus-core = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-core-types = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-devtools-types = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-cli-config = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-dx-wire-format = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-cli-telemetry = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+dioxus-component-manifest = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+wasm-split-cli = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+depinfo = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+subsecond-types = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+manganis = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+manganis-core = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+manganis-core-07 = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+const-serialize = { git = "https://github.com/DioxusLabs/dioxus", tag = "v0.7.10" }
+
+# Third-party crates: versions match the Dioxus v0.7.10 workspace.
+ansi-to-html = "0.2.2"
+ansi-to-tui = "7.0"
+anyhow = "1.0.98"
+axum = { version = "0.8.4", default-features = false }
+axum-extra = "0.10.1"
+axum-server = { version = "0.7.3", default-features = false }
+bytes = "1.10.1"
+cargo-config2 = "0.1.34"
+cargo_metadata = "0.19.2"
+cargo_toml = "0.22.3"
+chrono = "0.4.39"
+clap = "4.5.40"
+convert_case = "0.8.0"
+crossterm = "0.28.1"
+dirs = "6.0.0"
+dunce = "1.0.5"
+futures-channel = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false }
+html_parser = "0.7.0"
+hyper = "1.6.0"
+hyper-rustls = { version = "0.27.7", default-features = false, features = [
+    "native-tokio",
+    "http1",
+    "http2",
+    "tls12",
+    "logging",
+    "ring",
+] }
+hyper-util = "0.1.12"
+icns = "0.4.0"
+image = "0.25.6"
+itertools = "0.14.0"
+krates = "0.17.5"
+md5 = "0.8.0"
+notify = "8.1.0"
+object = "0.37.1"
+open = "5.3.2"
+owo-colors = "4.2.2"
+path-absolutize = "3.1"
+pretty_assertions = "1"
+prettyplease = { version = "0.2.35", features = ["verbatim"] }
+proc-macro2 = "1.0.101"
+ratatui = "0.29.0"
+rayon = "1.10.0"
+reqwest = { version = "0.12.28", default-features = false }
+rpm = { version = "0.20.0", default-features = false, features = ["gzip-compression"] }
+rustls = { version = "0.23.28", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+    "ring",
+] }
+serde = "1.0.225"
+serde_json = "1.0.140"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+shell-words = "1.1.0"
+syn = "2.0.104"
+thiserror = "2.0.12"
+tokio = "1.48"
+tokio-stream = "0.1.17"
+tokio-tungstenite = "0.28.0"
+tokio-util = "0.7.15"
+toml = "0.8.23"
+tower = "0.5.2"
+tower-http = "0.6.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false }
+uuid = "1.17.0"
+walkdir = "2.5.0"
+walrus = { version = "0.23.3", features = ["parallel"] }
+wasmparser = "0.235.0"
+zip = { version = "4", default-features = false, features = ["deflate"] }
