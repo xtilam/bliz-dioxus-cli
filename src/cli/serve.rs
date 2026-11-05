@@ -60,6 +60,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false, alias = "hotpatch")]
     pub(crate) hot_patch: bool,
 
+    /// Hot-patch code inside `rsx!` macros through the Rust hot-patch engine.
+    ///
+    /// This implies `--hot-patch` and disables RSX template hot-reloading.
+    #[arg(long, default_value_t = false, alias = "hotpatch-rsx")]
+    pub(crate) hot_patch_rsx: bool,
+
     /// Watch the filesystem for changes and trigger a rebuild [default: true]
     #[clap(long, default_missing_value = "true", num_args=0..=1)]
     pub(crate) watch: Option<bool>,
@@ -91,7 +97,11 @@ impl ServeArgs {
     /// higher log levels
     ///
     /// We also set up proper panic handling since the TUI has a tendency to corrupt the terminal.
-    pub(crate) async fn serve(self, tracer: &TraceController) -> Result<StructuredOutput> {
+    pub(crate) async fn serve(mut self, tracer: &TraceController) -> Result<StructuredOutput> {
+        // `--hot-patch-rsx` is a variant of `--hot-patch`: it uses the same engine
+        // but bypasses the RSX template diff in the runner.
+        self.hot_patch |= self.hot_patch_rsx;
+
         // Redirect all logging the cli logger - if there's any pending after a panic, we flush it
         let is_interactive_tty = self.is_interactive_tty();
         if is_interactive_tty {
@@ -121,6 +131,7 @@ impl Anonymized for ServeArgs {
             "wsl_file_poll_interval": self.wsl_file_poll_interval,
             "interactive": self.interactive,
             "hot_patch": self.hot_patch,
+            "hot_patch_rsx": self.hot_patch_rsx,
             "watch": self.watch,
             "exit_on_error": self.exit_on_error,
             "platform_args": self.platform_args.anonymized(),

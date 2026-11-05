@@ -57,6 +57,8 @@ pub(crate) struct AppServer {
 
     // Resolved args related to how we go about processing the rebuilds and logging
     pub(crate) use_hotpatch_engine: bool,
+    /// When true, bypass the RSX diff and hot-patch all Rust changes.
+    pub(crate) hot_patch_rsx: bool,
     pub(crate) automatic_rebuilds: bool,
     pub(crate) interactive: bool,
     pub(crate) _force_sequential: bool,
@@ -168,6 +170,7 @@ impl AppServer {
             .flatten();
 
         let watch_fs = args.watch.unwrap_or(true);
+        let hot_patch_rsx = args.hot_patch_rsx;
         let use_hotpatch_engine = args.hot_patch;
 
         let client = AppBuilder::new(&client)?;
@@ -191,6 +194,7 @@ impl AppServer {
             automatic_rebuilds: true,
             watch_fs,
             use_hotpatch_engine,
+            hot_patch_rsx,
             client,
             server,
             hot_reload,
@@ -350,6 +354,9 @@ impl AppServer {
     /// Handle the list of changed files from the file watcher, attempting to aggressively prevent
     /// full rebuilds by hot-reloading RSX and hot-patching Rust code.
     ///
+    /// When `hot_patch_rsx` is enabled, the RSX diff is skipped and every Rust change is sent
+    /// through the hot-patch engine, including code inside `rsx!` macros.
+    ///
     /// This will also handle any assets that are linked in the files, and copy them to the bundle
     /// and send them to the client.
     pub(crate) async fn handle_file_change(&mut self, files: &[PathBuf], server: &mut WebServer) {
@@ -401,6 +408,13 @@ impl AppServer {
 
             // If it's a rust file, we want to hotreload it using the filemap
             if ext == "rs" {
+                // With --hot-patch-rsx we intentionally skip the RSX diff and let the
+                // hot-patch engine rebuild the crate, including code inside rsx! macros.
+                if self.hot_patch_rsx {
+                    needs_full_rebuild = true;
+                    continue;
+                }
+
                 // And grabout the contents
                 let Ok(new_contents) = std::fs::read_to_string(path) else {
                     tracing::debug!("Failed to read rust file while hotreloading: {:?}", path);

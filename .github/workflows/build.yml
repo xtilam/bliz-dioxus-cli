@@ -1,0 +1,45 @@
+name: Build dx
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build dx with Nix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build
+        run: nix build .#default --print-build-logs
+
+      - name: Verify
+        run: ./result/bin/dx --version
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp -L result/bin/dx dist/dx
+          chmod +x dist/dx
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx-x86_64-linux
+          path: dist/dx
+          if-no-files-found: error

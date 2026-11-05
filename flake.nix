@@ -1,5 +1,5 @@
 {
-  description = "Development shell for the bliz Dioxus CLI (dx)";
+  description = "Development shell and package for the bliz Dioxus CLI (dx)";
 
   inputs = {
     # nixos-26.05 currently ships rustc 1.95, but the latest compatible
@@ -29,6 +29,35 @@
         );
     in
     {
+      packages = forAllSystems (pkgs: {
+        default = pkgs.rustPlatform.buildRustPackage {
+          pname = "dioxus-cli";
+          version = "0.7.10";
+          src = self;
+
+          cargoHash = "sha256-PBFKq758AVxzEc+TLfj6WyeSdpiFsQQjC7l1e7wmVyg=";
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
+
+          env = {
+            OPENSSL_NO_VENDOR = "1";
+          };
+
+          doCheck = false;
+
+          meta = {
+            description = "CLI for building fullstack web, desktop, and mobile apps with a single codebase.";
+            homepage = "https://dioxus.dev";
+            license = with pkgs.lib.licenses; [
+              mit
+              asl20
+            ];
+            mainProgram = "dx";
+          };
+        };
+      });
+
       devShells = forAllSystems (
         pkgs:
         let
@@ -53,7 +82,7 @@
             buildInputs =
               with pkgs;
               [ openssl ]
-              ++ lib.optionals stdenv.isDarwin [
+              ++ lib.optionals stdenv.hostPlatform.isDarwin [
                 libiconv
               ];
 
@@ -68,6 +97,7 @@
               echo "dioxus-cli dev shell"
               echo "  cargo build --bin dx   -> target/debug/dx"
               echo "  cargo build --release  -> target/release/dx"
+              echo "  nix build              -> result/bin/dx"
             '';
           };
         }
