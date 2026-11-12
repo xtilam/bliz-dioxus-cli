@@ -211,7 +211,7 @@ use dioxus_cli_config::{APP_TITLE_ENV, ASSET_ROOT_ENV};
 use krates::{cm::TargetKind, NodeId};
 use manganis::BundledAsset;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, collections::VecDeque, ffi::OsString};
 use std::{
     collections::HashSet,
@@ -340,6 +340,25 @@ pub struct BuildArtifacts {
     pub(crate) patch_cache: Option<Arc<HotpatchModuleCache>>,
     pub(crate) depinfo: RustcDepInfo,
     pub(crate) build_id: BuildId,
+}
+
+/// Records the artifact produced by the last successful fat link.
+///
+/// Written next to the artifact; if the size/mtime still match on a later build then the binary
+/// is unchanged since that link and can be reused when cargo skips the linker step entirely.
+#[derive(Serialize, Deserialize)]
+struct FatLinkSentinel {
+    len: u64,
+    mtime_ns: u128,
+}
+
+fn file_mtime_ns(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 impl BuildRequest {
@@ -1003,6 +1022,12 @@ impl BuildRequest {
                 ctx.profile_phase("Populating cache");
                 self.fill_caches(&ctx, &mut artifacts).await?;
 
+                // Remember the final artifact so a later fat build can skip the link when
+                // cargo considers the build fresh (and therefore never invokes the linker).
+                if matches!(ctx.mode, BuildMode::Fat) {
+                    self.write_fat_link_sentinel(&artifacts.exe);
+                }
+
                 tracing::debug!("Bundle created at {}", self.root_dir().display());
 
                 Ok(artifacts)
@@ -1191,7 +1216,8 @@ impl BuildRequest {
     /// This might stop working if/when cargo stabilizes contents-based fingerprinting.
     ///
     /// `dx` compiles everything with `--target` which ends up with a structure like:
-    /// `target/<triple>/<profile>/.fingerprint/<package_name>-<hash>`
+    /// `target/<triple>/<profile>/.fingerprint/<package_name>-<hash>` on older cargo, or
+    /// `target/<triple>/<profile>/build/<package_name>/<hash>/fingerprint` on newer cargo.
     ///
     /// Normally you can't rely on this structure (ie with `cargo build`) but the explicit
     /// target arg guarantees this will work.
@@ -1210,6 +1236,10 @@ impl BuildRequest {
     /// still valid and we skip busting so cargo can reuse its incremental artifacts. If the
     /// file is missing, we bust that crate's fingerprint to force the rustc wrapper to
     /// re-capture its args.
+    ///
+    /// Note that cargo's fingerprint layout is an internal detail and has changed across
+    /// releases (see [`Self::bust_package_fingerprint`]), which is why we probe both known
+    /// layouts instead of assuming `.fingerprint/<package>-<hash>` exists.
     fn bust_fingerprint(&self, ctx: &BuildContext) -> Result<()> {
         // Ensure the rustc args capture directory exists - only in fat/base builds.
         // This ensures we always capture fresh rustc args provided we're not hotpatching. This could
@@ -1239,25 +1269,17 @@ impl BuildRequest {
             .rustc_wrapper_args_dir()
             .join(self.rustc_wrapper_scope_dir_name(&BuildMode::Fat)?);
 
-        for dep_name in self.workspace_crate_dep_names() {
-            if !scope_dir.join(format!("{dep_name}.lib.json")).exists() {
-                bust.insert(dep_name);
+        for package_name in self.workspace_crate_dep_package_names() {
+            // The rustc wrapper keys its captures by crate name (hyphens replaced with
+            // underscores), while cargo's fingerprint/build dirs use the raw package name.
+            let arg_key = package_name.replace('-', "_");
+            if !scope_dir.join(format!("{arg_key}.lib.json")).exists() {
+                bust.insert(package_name);
             }
         }
 
-        let fingerprint_dir = self.cargo_fingerprint_dir();
-        for entry in std::fs::read_dir(&fingerprint_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            if let Some(fname) = entry.file_name().to_str() {
-                if let Some((name, _)) = fname.rsplit_once('-') {
-                    if bust.contains(name) {
-                        _ = std::fs::remove_dir_all(entry.path());
-                    }
-                }
-            }
+        for package_name in bust {
+            self.bust_package_fingerprint(&package_name);
         }
 
         Ok(())
@@ -2609,6 +2631,55 @@ impl BuildRequest {
         self.session_cache_dir().join("windows_command.txt")
     }
 
+    /// Marker file recording the artifact produced by the last successful fat link.
+    ///
+    /// The file lives next to the artifact so it is invalidated whenever cargo deletes or
+    /// rebuilds that unit.
+    fn fat_link_sentinel_file(&self, exe: &Path) -> PathBuf {
+        exe.with_file_name(format!(
+            "{}.dx-fat-ok",
+            exe.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        ))
+    }
+
+    /// Returns true if `exe` is still the exact binary produced by the last successful fat link,
+    /// i.e. nothing has written to it since.
+    pub(crate) fn fat_link_sentinel_matches(&self, exe: &Path) -> bool {
+        let Ok(contents) = std::fs::read(self.fat_link_sentinel_file(exe)) else {
+            return false;
+        };
+        let Ok(sentinel) = serde_json::from_slice::<FatLinkSentinel>(&contents) else {
+            return false;
+        };
+        let Ok(metadata) = std::fs::metadata(exe) else {
+            return false;
+        };
+
+        sentinel.len == metadata.len() && sentinel.mtime_ns == file_mtime_ns(&metadata)
+    }
+
+    /// Record the size/mtime of a successfully fat-linked binary. Best-effort: a missing marker
+    /// only means we cannot skip the fat link later, never a build failure.
+    pub(crate) fn write_fat_link_sentinel(&self, exe: &Path) {
+        let Ok(metadata) = std::fs::metadata(exe) else {
+            return;
+        };
+        let sentinel = FatLinkSentinel {
+            len: metadata.len(),
+            mtime_ns: file_mtime_ns(&metadata),
+        };
+        match serde_json::to_vec(&sentinel) {
+            Ok(bytes) => {
+                if let Err(err) = std::fs::write(self.fat_link_sentinel_file(exe), bytes) {
+                    tracing::debug!("Failed to write fat link sentinel: {err}");
+                }
+            }
+            Err(err) => tracing::debug!("Failed to encode fat link sentinel: {err}"),
+        }
+    }
+
     /// Get the outdir specified by the Dioxus.toml, relative to the crate directory.
     /// We don't support workspaces yet since that would cause a collision of bundles per project.
     pub(crate) fn crate_out_dir(&self) -> Option<PathBuf> {
@@ -3078,11 +3149,48 @@ impl BuildRequest {
             .collect()
     }
 
-    fn cargo_fingerprint_dir(&self) -> PathBuf {
+    /// The directory cargo writes build artifacts to for the current triple/profile.
+    pub(crate) fn cargo_profile_dir(&self) -> PathBuf {
         self.target_dir
             .join(self.triple.to_string())
             .join(&self.profile)
-            .join(".fingerprint")
+    }
+
+    /// Remove the fingerprint(s) cargo recorded for `package_name` so the next build
+    /// recompiles and relinks that package.
+    ///
+    /// Cargo's on-disk layout is an internal detail and has changed across releases, so we
+    /// handle both layouts we know about:
+    ///
+    /// - legacy (`cargo <= 1.9x`): `<profile>/.fingerprint/<package>-<hash>/`
+    /// - current (`cargo >= 1.100`): `<profile>/build/<package>/<unit-hash>/fingerprint/`
+    ///
+    /// In the current layout only the `fingerprint` directory is removed, leaving the
+    /// (expensive) `out/` directory in place so cargo can reuse it.
+    fn bust_package_fingerprint(&self, package_name: &str) {
+        let profile_dir = self.cargo_profile_dir();
+
+        // Legacy layout: `.fingerprint/<package>-<hash>/`
+        if let Ok(entries) = std::fs::read_dir(profile_dir.join(".fingerprint")) {
+            for entry in entries.flatten() {
+                if let Some((name, _)) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.rsplit_once('-'))
+                {
+                    if name == package_name {
+                        _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Current layout: `build/<package>/<unit-hash>/fingerprint/`
+        if let Ok(entries) = std::fs::read_dir(profile_dir.join("build").join(package_name)) {
+            for entry in entries.flatten() {
+                _ = std::fs::remove_dir_all(entry.path().join("fingerprint"));
+            }
+        }
     }
 
     fn is_apple_target(&self) -> bool {
@@ -3092,24 +3200,26 @@ impl BuildRequest {
         )
     }
 
-    /// All workspace crate names that the tip crate transitively depends on
-    /// (underscore-normalized, excluding the tip itself).
-    fn workspace_crate_dep_names(&self) -> Vec<String> {
+    /// Manifest names (hyphens preserved) of every workspace package the tip crate
+    /// transitively depends on, excluding the tip itself.
+    ///
+    /// Cargo keys its fingerprint/build directories by the raw package name, so this is the
+    /// form needed when busting fingerprints. The rustc wrapper instead keys captures by the
+    /// underscore-normalized crate name.
+    fn workspace_crate_dep_package_names(&self) -> Vec<String> {
         let krates = &self.workspace.krates;
 
         let workspace_names: HashSet<String> = krates
             .workspace_members()
             .filter_map(|m| match m {
-                krates::Node::Krate { krate, .. } => Some(krate.name.replace('-', "_")),
+                krates::Node::Krate { krate, .. } => Some(krate.name.clone()),
                 _ => None,
             })
             .collect();
 
-        let tip = self.tip_package_name();
+        let tip = self.package().name.clone();
         let Some(tip_nid) = krates.workspace_members().find_map(|m| match m {
-            krates::Node::Krate { id, krate, .. } if krate.name.replace('-', "_") == tip => {
-                krates.nid_for_kid(id)
-            }
+            krates::Node::Krate { id, krate, .. } if krate.name == tip => krates.nid_for_kid(id),
             _ => None,
         }) else {
             return Vec::new();
@@ -3122,9 +3232,8 @@ impl BuildRequest {
 
         while let Some(nid) = queue.pop_front() {
             for dep in krates.direct_dependencies(nid) {
-                let name = dep.krate.name.replace('-', "_");
-                if workspace_names.contains(&name) && visited.insert(dep.node_id) {
-                    deps.push(name);
+                if workspace_names.contains(&dep.krate.name) && visited.insert(dep.node_id) {
+                    deps.push(dep.krate.name.clone());
                     queue.push_back(dep.node_id);
                 }
             }

@@ -471,6 +471,10 @@ impl AppBuilder {
             let tx = self.tx.clone();
             async move {
                 let ctx = BuildContext::new(tx, mode, build_id);
+                // Mirror `start()`: reset per-build state (captured link args, linker errors,
+                // etc.) before rebuilding. Without this a full rebuild can consume stale link
+                // args left behind by a previous (thin) build and link against deleted objects.
+                request.prebuild(&ctx).await?;
                 request.build(ctx).await
             }
         });

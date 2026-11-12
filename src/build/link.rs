@@ -791,17 +791,34 @@ impl BuildRequest {
         exe: &Path,
         set: &WorkspaceRustcArgs,
     ) -> Result<()> {
+        // Cargo may consider the build fresh (nothing changed since the last build), in which
+        // case it never invokes the linker and no link args get captured. If the artifact is
+        // still exactly what the last successful fat link produced, reuse it instead of failing.
+        if set.link_args.is_empty() {
+            if self.fat_link_sentinel_matches(exe) {
+                tracing::info!(
+                    "No new link detected for '{}' — reusing the existing fat binary.",
+                    self.tip_crate_name()
+                );
+                return Ok(());
+            }
+
+            bail!(
+                "Missing linker args for fat link of '{}'. The tip crate likely did not run through linker interception for this build. \
+                 Try deleting '{}' and rebuilding.",
+                self.tip_crate_name(),
+                self.cargo_profile_dir()
+                    .join("build")
+                    .join(self.package().name.clone())
+                    .display(),
+            );
+        }
+
         // Get the tip crate rustc argsa
         let rustc_args = set
             .rustc_args
             .get(&format!("{}.bin", self.tip_crate_name()))
             .context("Missing rustc capture")?;
-
-        ensure!(
-            !set.link_args.is_empty(),
-            "Missing linker args for fat link of '{}'. The tip crate likely did not run through linker interception for this build.",
-            self.tip_crate_name()
-        );
 
         let link_start = SystemTime::now();
         ctx.status_starting_fat_link();
