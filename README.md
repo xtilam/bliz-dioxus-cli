@@ -11,10 +11,10 @@ It handles building, bundling, development and publishing to simplify developmen
 ### Install from git
 
 ```shell
-cargo install --git https://github.com/xtilam/bliz-dioxus-cli --tag rcX
+cargo install --git https://github.com/xtilam/bliz-dioxus-cli --tag v0.17.10-rcx
 ```
 
-This will download the CLI at the `rcX` tag,
+This will download the CLI at the `v0.17.10-rcx` tag,
 and install it in Cargo's global binary directory (`~/.cargo/bin/` by default).
 
 ### Install from local folder
