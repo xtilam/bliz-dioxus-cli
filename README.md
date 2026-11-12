@@ -8,23 +8,13 @@ It handles building, bundling, development and publishing to simplify developmen
 
 ## Installation
 
-### Install the stable version (recommended)
+### Install from git
 
 ```shell
-cargo install dioxus-cli
+cargo install --git https://github.com/xtilam/bliz-dioxus-cli --tag rcX
 ```
 
-### Install the latest development build through git
-
-To get the latest bug fixes and features, you can install the development version from git.
-However, this is not fully tested.
-That means you're probably going to have more bugs despite having the latest bug fixes.
-
-```shell
-cargo install --git https://github.com/DioxusLabs/dioxus dioxus-cli
-```
-
-This will download the CLI from the master branch,
+This will download the CLI at the `rcX` tag,
 and install it in Cargo's global binary directory (`~/.cargo/bin/` by default).
 
 ### Install from local folder
