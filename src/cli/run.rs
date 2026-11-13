@@ -64,6 +64,14 @@ impl RunArgs {
                                     );
                                 });
 
+                            if builder.inherit_stdio {
+                                if builder.any_inherited_child_running() {
+                                    crate::logging::pause_output();
+                                } else {
+                                    crate::logging::resume_output();
+                                }
+                            }
+
                             if bundle_format == BundleFormat::Web {
                                 tracing::info!(
                                     "Serving app at http://{}:{}",
@@ -149,6 +157,10 @@ impl RunArgs {
                             tracing::error!("[{bundle_format}] {msg}");
                         }
                         BuilderUpdate::ProcessExited { status } => {
+                            if builder.inherit_stdio && !builder.any_inherited_child_running() {
+                                crate::logging::resume_output();
+                            }
+
                             if !status.success() {
                                 tracing::error!(
                                     "Application [{bundle_format}] exited with error: {status}"
@@ -176,6 +188,8 @@ impl RunArgs {
                 ServeUpdate::TracingLog { .. } => {}
             }
         }
+
+        crate::logging::resume_output();
 
         Ok(StructuredOutput::Success)
     }

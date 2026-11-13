@@ -75,6 +75,9 @@ pub(crate) struct AppBuilder {
     // These might be None if the app died or the user did not specify a server
     pub child: Option<Child>,
 
+    /// Inherit the terminal's stdin/stdout/stderr for the app instead of piping stdout/stderr.
+    pub inherit_stdio: bool,
+
     // stdio for the app so we can read its stdout/stderr
     // we don't map stdin today (todo) but most apps don't need it
     pub stdout: Option<Lines<BufReader<ChildStdout>>>,
@@ -159,6 +162,7 @@ impl AppBuilder {
             bundle_end: None,
             runtime_asset_dir: None,
             child: None,
+            inherit_stdio: false,
             stderr: None,
             stdout: None,
             adb_logcat_stdout: None,
@@ -1008,18 +1012,29 @@ impl AppBuilder {
 
         tracing::debug!("Opening app with main exe: {main_exe:?}");
 
-        let mut child = Command::new(main_exe)
-            .args(args)
-            .envs(envs)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut command = Command::new(main_exe);
+        command.args(args).envs(envs).kill_on_drop(true);
 
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let stderr = BufReader::new(child.stderr.take().unwrap());
-        self.stdout = Some(stdout.lines());
-        self.stderr = Some(stderr.lines());
+        if self.inherit_stdio {
+            // Let the app own the terminal. The CLI buffers its own output while the app runs and
+            // restores it once the process exits.
+            command
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+
+        let mut child = command.spawn()?;
+
+        if !self.inherit_stdio {
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            let stderr = BufReader::new(child.stderr.take().unwrap());
+            self.stdout = Some(stdout.lines());
+            self.stderr = Some(stderr.lines());
+        }
+
         self.child = Some(child);
 
         Ok(())

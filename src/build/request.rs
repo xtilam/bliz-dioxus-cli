@@ -1086,7 +1086,7 @@ impl BuildRequest {
 
             // If raw JSON diagnostics are requested, relay the line directly
             if self.raw_json_diagnostics {
-                println!("{}", line);
+                crate::logging::print_stdout_line(&line);
             }
 
             let Some(Ok(message)) = Message::parse_stream(std::io::Cursor::new(line)).next() else {

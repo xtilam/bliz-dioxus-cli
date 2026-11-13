@@ -42,6 +42,7 @@ use futures_util::FutureExt;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::io::Write as _;
 use std::{any::Any, io::Read, pin::Pin, str::FromStr, sync::Arc, time::SystemTime};
 use std::{borrow::Cow, sync::OnceLock};
 use std::{
@@ -68,6 +69,138 @@ const LOG_ENV: &str = "DIOXUS_LOG";
 const DX_SRC_FLAG: &str = "dx_src";
 
 pub static VERBOSITY: OnceLock<Verbosity> = OnceLock::new();
+
+/// Buffers the CLI's own output while an app process owns the terminal.
+///
+/// With `dx serve --inherit-stdio` the app gets the real stdin/stdout/stderr. The CLI still needs
+/// to log builds, but writing to those streams would interleave with the app, so everything is
+/// collected in memory and flushed once the app exits.
+#[derive(Clone, Default)]
+pub(crate) struct BufferedOutput {
+    state: Arc<std::sync::Mutex<BufferedOutputState>>,
+}
+
+#[derive(Default)]
+struct BufferedOutputState {
+    paused: bool,
+    buffer: Vec<u8>,
+}
+
+static BUFFERED_OUTPUT: OnceLock<BufferedOutput> = OnceLock::new();
+
+/// Initialize the in-memory output buffer used by `--inherit-stdio`.
+pub(crate) fn init_buffered_output() {
+    let _ = BUFFERED_OUTPUT.set(BufferedOutput::default());
+}
+
+pub(crate) fn buffered_output() -> Option<&'static BufferedOutput> {
+    BUFFERED_OUTPUT.get()
+}
+
+/// Stop writing the CLI's logs to the terminal. Output is accumulated in memory instead.
+pub(crate) fn pause_output() {
+    if let Some(output) = BUFFERED_OUTPUT.get() {
+        output.pause();
+    }
+}
+
+/// Resume writing to the terminal and flush everything that was buffered while the app ran.
+pub(crate) fn resume_output() {
+    if let Some(output) = BUFFERED_OUTPUT.get() {
+        output.resume_and_flush();
+    }
+}
+
+/// Print a raw line to stdout, respecting the in-memory output buffer.
+pub(crate) fn print_stdout_line(line: &str) {
+    use tracing_subscriber::fmt::MakeWriter as _;
+
+    match BUFFERED_OUTPUT.get() {
+        Some(output) => {
+            let mut writer = output.make_writer();
+            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.write_all(b"\n");
+            let _ = writer.flush();
+        }
+        None => println!("{line}"),
+    }
+}
+
+impl BufferedOutput {
+    fn pause(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.paused = true;
+    }
+
+    fn resume_and_flush(&self) {
+        let data = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.paused = false;
+            std::mem::take(&mut state.buffer)
+        };
+
+        if !data.is_empty() {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let _ = stdout.write_all(&data);
+            let _ = stdout.flush();
+        }
+    }
+}
+
+pub(crate) struct BufferedOutputWriter {
+    state: Arc<std::sync::Mutex<BufferedOutputState>>,
+}
+
+impl std::io::Write for BufferedOutputWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if state.paused {
+            state.buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        } else {
+            drop(state);
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            stdout.write_all(buf)?;
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if state.paused {
+            Ok(())
+        } else {
+            drop(state);
+            std::io::stdout().flush()
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferedOutput {
+    type Writer = BufferedOutputWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BufferedOutputWriter {
+            state: self.state.clone(),
+        }
+    }
+}
 
 pub fn verbosity_or_default() -> Verbosity {
     crate::VERBOSITY.get().cloned().unwrap_or_default()
@@ -137,6 +270,17 @@ impl TraceController {
         let tui_active = Arc::new(AtomicBool::new(false));
         let is_serve_cmd = matches!(args.action, Commands::Serve(_));
 
+        // When the app owns the terminal, keep the CLI's own logs in memory instead of writing
+        // them to stdout/stderr until the app exits.
+        let inherit_stdio = match &args.action {
+            Commands::Serve(opts) => opts.inherit_stdio,
+            Commands::Run(opts) => opts.args.inherit_stdio,
+            _ => false,
+        };
+        if inherit_stdio {
+            init_buffered_output();
+        }
+
         VERBOSITY
             .set(args.verbosity.clone())
             .expect("verbosity should only be set once");
@@ -191,10 +335,15 @@ impl TraceController {
 
         // If json output is enabled, we want to format the output as JSON
         // When running in interactive mode (of which serve is the only one), we don't want to log to console directly
-        let fmt_layer = if args.verbosity.json_output {
-            fmt_layer.json().flatten_event(true).boxed()
-        } else {
-            fmt_layer.boxed()
+        let fmt_layer = match (buffered_output(), args.verbosity.json_output) {
+            (Some(output), true) => fmt_layer
+                .json()
+                .flatten_event(true)
+                .with_writer(output.clone())
+                .boxed(),
+            (Some(output), false) => fmt_layer.with_writer(output.clone()).boxed(),
+            (None, true) => fmt_layer.json().flatten_event(true).boxed(),
+            (None, false) => fmt_layer.boxed(),
         }
         .with_filter(tracing_subscriber::filter::filter_fn({
             let tui_active = tui_active.clone();
@@ -343,6 +492,11 @@ impl TraceController {
     // Redirects the tracing logs to the TUI if it's active, otherwise it just collects them.
     pub fn redirect_to_tui(&self) {
         self.tui_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop routing logs to the TUI, e.g. while the app owns the terminal.
+    pub(crate) fn stop_tui_redirect(&self) {
+        self.tui_active.store(false, Ordering::Relaxed);
     }
 
     /// Wait for the internal logger to send a message
@@ -636,6 +790,8 @@ impl TraceController {
     ) -> StructuredOutput {
         // Drain the tracer as regular messages
         self.tui_active.store(false, Ordering::Relaxed);
+        // If the app was still running, restore the CLI's output and flush anything buffered.
+        resume_output();
         reset_cursor();
 
         // re-emit any remaining messages in case they're useful.
