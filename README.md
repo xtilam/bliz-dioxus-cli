@@ -37,6 +37,41 @@ dx new --template gh:dioxuslabs/dioxus-template
 Run `dx --help` for a list of all the available commands.
 Furthermore, you can run `dx <command> --help` to get help with a specific command.
 
+## Added CLI flags
+
+This fork adds two flags to `dx serve`. Both are also accepted by `dx run`, which forwards the
+`dx serve` arguments.
+
+### `--hot-patch-rsx`
+
+Hot-patch code inside `rsx!` macros through the Rust hot-patch engine.
+
+- Implies `--hot-patch` and disables RSX template hot-reloading.
+- Every change to a `.rs` file is sent to the hot-patch engine, including code inside `rsx!`.
+  The CLI no longer splits changes into an "RSX-only" template diff that a client would apply.
+- Useful for `dioxus-native` targets, which have no browser client to receive RSX template
+  hot-reloads.
+
+```shell
+dx serve --hot-patch-rsx
+```
+
+### `--inherit-stdio`
+
+Give the app process the terminal's stdin, stdout, and stderr.
+
+- The app can read from stdin and writes directly to the terminal, which is useful for
+  interactive or long-running apps.
+- While the app runs, the CLI buffers its own log output in memory and flushes it when the app
+  exits.
+- The TUI is disabled while the app owns the terminal and is reclaimed once the app exits.
+- Supported for desktop and server targets. It is ignored for web, iOS, and Android, where the app
+  does not run as a local process.
+
+```shell
+dx serve --inherit-stdio
+```
+
 ## Dioxus config file
 
 You can use the `Dioxus.toml` file for further configuration.
