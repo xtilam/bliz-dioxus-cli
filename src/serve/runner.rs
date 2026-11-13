@@ -64,6 +64,8 @@ pub(crate) struct AppServer {
     pub(crate) _force_sequential: bool,
     pub(crate) hot_reload: bool,
     pub(crate) open_browser: bool,
+    /// Whether any spawned app process inherits the terminal's stdio.
+    pub(crate) inherit_stdio: bool,
     pub(crate) _wsl_file_poll_interval: u16,
     pub(crate) always_on_top: bool,
     pub(crate) fullstack: bool,
@@ -103,6 +105,7 @@ impl AppServer {
         let interactive = args.is_interactive_tty();
         let force_sequential = args.platform_args.shared.targets.force_sequential_build();
         let cross_origin_policy = args.cross_origin_policy;
+        let inherit_stdio = args.inherit_stdio;
 
         // Find the launch args for the client and server
         let split_args = |args: &str| {
@@ -176,6 +179,34 @@ impl AppServer {
         let client = AppBuilder::new(&client)?;
         let server = server.map(|server| AppBuilder::new(&server)).transpose()?;
 
+        // Only platforms that run the app as a local process can inherit stdio. Web has no app
+        // process, and iOS/Android launch through xcrun/adb.
+        let supports_inherit_stdio = |bundle: BundleFormat| {
+            matches!(
+                bundle,
+                BundleFormat::Server
+                    | BundleFormat::MacOS
+                    | BundleFormat::Windows
+                    | BundleFormat::Linux
+            )
+        };
+
+        let inherit_stdio_requested = inherit_stdio;
+        let mut client = client;
+        let mut server = server;
+        client.inherit_stdio = inherit_stdio && supports_inherit_stdio(client.build.bundle);
+        if let Some(server) = server.as_mut() {
+            server.inherit_stdio = inherit_stdio && supports_inherit_stdio(server.build.bundle);
+        }
+
+        let inherit_stdio =
+            client.inherit_stdio || server.as_ref().is_some_and(|s| s.inherit_stdio);
+        if inherit_stdio_requested && !inherit_stdio {
+            tracing::warn!(
+                "--inherit-stdio is only supported for desktop and server targets; ignoring"
+            );
+        }
+
         let tw_watcher = TailwindCli::serve(
             client.build.package_manifest_dir(),
             client.build.config.application.tailwind_input.clone(),
@@ -199,6 +230,7 @@ impl AppServer {
             server,
             hot_reload,
             open_browser,
+            inherit_stdio,
             _wsl_file_poll_interval: wsl_file_poll_interval,
             always_on_top,
             workspace,
@@ -589,6 +621,15 @@ impl AppServer {
                 tracing::debug!(dx_src = ?TraceSrc::Dev, "Ignoring file change: {}", file);
             }
         }
+    }
+
+    /// Returns true if any app process that inherited the terminal's stdio is still running.
+    pub(crate) fn any_inherited_child_running(&self) -> bool {
+        self.client.child.is_some()
+            || self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.child.is_some())
     }
 
     /// Finally "bundle" this app and return a handle to it

@@ -42,9 +42,22 @@ pub(crate) use update::*;
 pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Result<()> {
     // Load the args into a plan, resolving all tooling, build dirs, arguments, decoding the multi-target, etc
     let exit_on_error = args.exit_on_error;
+    let tui_requested = args.tui_requested();
+    let inherit_requested = args.inherit_stdio;
     let mut builder = AppServer::new(args).await?;
+
+    // `--inherit-stdio` is ignored on platforms that don't spawn a local app process (web, iOS,
+    // Android). In that case the TUI should behave exactly like a normal `dx serve`.
+    let interactive =
+        builder.interactive || (tui_requested && inherit_requested && !builder.inherit_stdio);
+    let reclaim_tui = builder.inherit_stdio && tui_requested;
+    builder.interactive = interactive;
+
     let mut devserver = WebServer::start(&builder)?;
-    let mut screen = Output::start(builder.interactive).await?;
+    let mut screen = Output::start(interactive, reclaim_tui).await?;
+    if interactive {
+        tracer.redirect_to_tui();
+    }
 
     // This is our default splash screen. We might want to make this a fancier splash screen in the future
     // Also, these commands might not be the most important, but it's all we've got enabled right now
@@ -193,9 +206,25 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                                 }
                             }
                             BuildMode::Base { .. } | BuildMode::Fat => {
-                                _ = builder
-                                    .open(&bundle, &mut devserver)
-                                    .await
+                                if builder.inherit_stdio {
+                                    // Release the terminal before spawning so the app doesn't
+                                    // inherit raw mode or a crossterm reader on stdin. Buffer our
+                                    // output from here on in case the app starts writing immediately.
+                                    screen.release_terminal();
+                                    tracer.stop_tui_redirect();
+                                    crate::logging::pause_output();
+                                }
+
+                                let open_result = builder.open(&bundle, &mut devserver).await;
+
+                                if builder.inherit_stdio && !builder.any_inherited_child_running() {
+                                    crate::logging::resume_output();
+                                    if screen.reclaim_terminal() {
+                                        tracer.redirect_to_tui();
+                                    }
+                                }
+
+                                _ = open_result
                                     .inspect_err(|e| tracing::error!("Failed to open app: {}", e));
                             }
                         }
@@ -219,6 +248,14 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                         screen.push_stdio(bundle_format, msg, tracing::Level::ERROR);
                     }
                     BuilderUpdate::ProcessExited { status } => {
+                        if builder.inherit_stdio && !builder.any_inherited_child_running() {
+                            // The app handed the terminal back; flush what we buffered while it ran.
+                            crate::logging::resume_output();
+                            if screen.reclaim_terminal() {
+                                tracer.redirect_to_tui();
+                            }
+                        }
+
                         if status.success() {
                             tracing::info!(
                                 r#"Application [{bundle_format}] exited gracefully.
@@ -259,11 +296,26 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                     builder.full_rebuild().await;
                     devserver.send_reload_start().await;
                     devserver.start_build().await;
-                } else if let Err(err) = builder.open_all(&devserver, true).await {
-                    tracing::error!(
-                        "Failed to open app: {}",
-                        crate::error::log_stacktrace(&err, 15)
-                    )
+                } else {
+                    if builder.inherit_stdio {
+                        screen.release_terminal();
+                        tracer.stop_tui_redirect();
+                        crate::logging::pause_output();
+                    }
+
+                    if let Err(err) = builder.open_all(&devserver, true).await {
+                        tracing::error!(
+                            "Failed to open app: {}",
+                            crate::error::log_stacktrace(&err, 15)
+                        )
+                    }
+
+                    if builder.inherit_stdio && !builder.any_inherited_child_running() {
+                        crate::logging::resume_output();
+                        if screen.reclaim_terminal() {
+                            tracer.redirect_to_tui();
+                        }
+                    }
                 }
             }
 
@@ -291,6 +343,8 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
             ServeUpdate::Exit { error } => {
                 _ = builder.shutdown().await;
                 _ = devserver.shutdown().await;
+                // Make sure anything buffered while the app was running is visible before we exit.
+                crate::logging::resume_output();
 
                 match error {
                     Some(err) => return Err(err),

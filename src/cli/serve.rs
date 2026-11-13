@@ -54,6 +54,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_missing_value="true", num_args=0..=1, short = 'i')]
     pub(crate) interactive: Option<bool>,
 
+    /// Give the app process the terminal's stdin/stdout/stderr.
+    ///
+    /// The CLI buffers its own output in memory while the app is running and flushes it once the
+    /// app exits. The TUI is disabled while the app owns the terminal and reclaimed afterwards.
+    #[arg(long, default_value_t = false)]
+    pub(crate) inherit_stdio: bool,
+
     /// Enable Rust hot-patching instead of full rebuilds [default: false]
     ///
     /// This is quite experimental and may lead to unexpected segfaults or crashes in development.
@@ -102,6 +109,11 @@ impl ServeArgs {
         // but bypasses the RSX template diff in the runner.
         self.hot_patch |= self.hot_patch_rsx;
 
+        // When the app owns the terminal, the TUI cannot run while the app is alive.
+        if self.inherit_stdio && self.interactive == Some(true) {
+            tracing::warn!("--inherit-stdio hands the terminal to the app while it runs");
+        }
+
         // Redirect all logging the cli logger - if there's any pending after a panic, we flush it
         let is_interactive_tty = self.is_interactive_tty();
         if is_interactive_tty {
@@ -113,10 +125,18 @@ impl ServeArgs {
             .map(|_| StructuredOutput::Success)
     }
 
-    /// Check if the server is running in interactive mode. This involves checking the terminal as well
-    pub(crate) fn is_interactive_tty(&self) -> bool {
+    /// Check if the TUI was requested and the terminal can support it.
+    pub(crate) fn tui_requested(&self) -> bool {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal() && self.interactive.unwrap_or(true)
+    }
+
+    /// Check if the server should start in interactive mode.
+    ///
+    /// With `--inherit-stdio` the app owns the terminal while it runs, so the TUI starts disabled
+    /// and is reclaimed whenever the app exits.
+    pub(crate) fn is_interactive_tty(&self) -> bool {
+        self.tui_requested() && !self.inherit_stdio
     }
 }
 
@@ -130,6 +150,7 @@ impl Anonymized for ServeArgs {
             "cross_origin_policy": self.cross_origin_policy,
             "wsl_file_poll_interval": self.wsl_file_poll_interval,
             "interactive": self.interactive,
+            "inherit_stdio": self.inherit_stdio,
             "hot_patch": self.hot_patch,
             "hot_patch_rsx": self.hot_patch_rsx,
             "watch": self.watch,

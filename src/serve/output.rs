@@ -50,6 +50,8 @@ pub struct Output {
     // A list of all messages from build, dev, app, and more.
     more_modal_open: bool,
     interactive: bool,
+    /// Whether the TUI should be reclaimed after an app process exits.
+    reclaimable: bool,
 
     // Whether to show verbose logs or not
     // We automatically hide "debug" logs if verbose is false (only showing "info" / "warn" / "error")
@@ -76,9 +78,10 @@ struct RenderState<'a> {
 }
 
 impl Output {
-    pub(crate) async fn start(interactive: bool) -> crate::Result<Self> {
+    pub(crate) async fn start(interactive: bool, reclaimable: bool) -> crate::Result<Self> {
         let mut output = Self {
             interactive,
+            reclaimable,
             term: Rc::new(RefCell::new(None)),
             dx_version: format!(
                 "{}-{}",
@@ -134,6 +137,42 @@ impl Output {
         }
 
         Ok(())
+    }
+
+    /// Hand the terminal over to the app process.
+    ///
+    /// This restores the terminal to its original mode, drops the crossterm event stream (so the
+    /// app can read stdin), and stops the TUI from rendering.
+    pub(crate) fn release_terminal(&mut self) {
+        if !self.interactive {
+            self.events = None;
+            return;
+        }
+
+        self.interactive = false;
+        self.events = None;
+        self.term.take();
+        let _ = Self::remote_shutdown(true);
+    }
+
+    /// Take the terminal back after the app process exits.
+    ///
+    /// Returns `true` if the TUI was successfully reclaimed.
+    pub(crate) fn reclaim_terminal(&mut self) -> bool {
+        if self.interactive {
+            return true;
+        }
+        if !self.reclaimable {
+            return false;
+        }
+
+        self.interactive = true;
+        if let Err(err) = self.startup() {
+            tracing::debug!("Failed to reclaim terminal after app exit: {err}");
+            self.interactive = false;
+        }
+
+        self.interactive
     }
 
     /// Enable raw mode, but don't let it block forever.
